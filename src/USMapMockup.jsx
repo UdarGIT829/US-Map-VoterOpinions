@@ -2,6 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 import { feature, mesh } from "topojson-client";
 
+import Legend from "./components/Legend.jsx";
+import useZoom from "./hooks/useZoom.js";
+
 /**
  * US Map Mockup
  * - Loads US states and counties TopoJSON from the us-atlas CDN
@@ -15,61 +18,29 @@ import { feature, mesh } from "topojson-client";
  *  - Styling uses Tailwind classes (available in this environment)
  */
 
-// State postal -> 2-digit FIPS (string)
-const STATE_FIPS = {
-  AL: "01",
-  AK: "02",
-  AZ: "04",
-  AR: "05",
-  CA: "06",
-  CO: "08",
-  CT: "09",
-  DE: "10",
-  DC: "11",
-  FL: "12",
-  GA: "13",
-  HI: "15",
-  ID: "16",
-  IL: "17",
-  IN: "18",
-  IA: "19",
-  KS: "20",
-  KY: "21",
-  LA: "22",
-  ME: "23",
-  MD: "24",
-  MA: "25",
-  MI: "26",
-  MN: "27",
-  MS: "28",
-  MO: "29",
-  MT: "30",
-  NE: "31",
-  NV: "32",
-  NH: "33",
-  NJ: "34",
-  NM: "35",
-  NY: "36",
-  NC: "37",
-  ND: "38",
-  OH: "39",
-  OK: "40",
-  OR: "41",
-  PA: "42",
-  RI: "44",
-  SC: "45",
-  SD: "46",
-  TN: "47",
-  TX: "48",
-  UT: "49",
-  VT: "50",
-  VA: "51",
-  WA: "53",
-  WV: "54",
-  WI: "55",
-  WY: "56",
-  PR: "72",
-};
+function useStateFipsFromFcc() {
+  const [map, setMap] = React.useState(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch("/fips.txt")
+      .then(r => r.text())
+      .then(txt => {
+        const out = {};
+        for (const raw of txt.split(/\r?\n/)) {
+          const line = raw.trim();
+          if (!line) continue;
+          const m = line.match(/^(\d{2})\s+(.+?)\s+([A-Z]{2})$/);
+          if (m) {
+            const [, ss, , abbr] = m;
+            out[abbr] = ss.padStart(2, "0");
+          }
+        }
+        if (!cancelled) setMap(out);
+      });
+    return () => { cancelled = true; };
+  }, []);
+  return map; // { CA: "06", ... } or null while loading
+}
 
 // Sample values (0..1) to demo coloring
 
@@ -207,48 +178,19 @@ export default function USMapMockup() {
   );
   const path = useMemo(() => d3.geoPath(projection), [projection]);
 
-  // Zoom behavior
-  useEffect(() => {
-    const svg = d3.select(svgRef.current);
-    const g = d3.select(gRef.current);
-
-    const zoom = d3
-      .zoom()
-      .scaleExtent([1, 12])
-      .on("zoom", (event) => {
-        g.attr("transform", event.transform);
-      });
-
-    svg.call(zoom);
-
-    const zoomTo = (featureGeom) => {
-      const bounds = path.bounds(featureGeom);
-      const dx = bounds[1][0] - bounds[0][0];
-      const dy = bounds[1][1] - bounds[0][1];
-      const x = (bounds[0][0] + bounds[1][0]) / 2;
-      const y = (bounds[0][1] + bounds[1][1]) / 2;
-      const scale = Math.max(
-        1,
-        Math.min(12, 0.9 / Math.max(dx / WIDTH, dy / HEIGHT)),
-      );
-      const translate = [WIDTH / 2 - scale * x, HEIGHT / 2 - scale * y];
-      svg
-        .transition()
-        .duration(700)
-        .call(
-          zoom.transform,
-          d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale),
-        );
-    };
-
-    // If a state is selected, zoom to it; else reset
-    if (selectedStateFips) {
-      const sf = stateFeatures.find((s) => s.id === selectedStateFips);
-      if (sf) zoomTo(sf);
-    } else {
-      svg.transition().duration(700).call(zoom.transform, d3.zoomIdentity);
-    }
-  }, [selectedStateFips, stateFeatures, path]);
+  const selectedStateFeature = useMemo(
+    () => (selectedStateFips ? stateFeatures.find((s) => s.id === selectedStateFips) : null),
+    [selectedStateFips, stateFeatures]
+  );
+  
+  useZoom({
+    svgRef,
+    gRef,
+    path,
+    featureToZoom: selectedStateFeature,
+    width: WIDTH,
+    height: HEIGHT,
+  });
 
   // Render paths each time data or selection changes
   useEffect(() => {
@@ -390,41 +332,3 @@ export default function USMapMockup() {
   );
 }
 
-function Legend({ title, scale }) {
-  // Simple SVG gradient legend 0..1
-  const id = useMemo(() => `grad-${Math.random().toString(36).slice(2)}`, []);
-  const stops = d3.range(0, 1.0001, 0.1).map((t) => ({ t, c: scale(t) }));
-  return (
-    <div className="bg-white rounded-2xl p-3 shadow">
-      <div className="text-sm font-medium mb-2">{title}</div>
-      <svg width={340} height={54}>
-        <defs>
-          <linearGradient id={id} x1="0%" x2="100%">
-            {stops.map((s, i) => (
-              <stop key={i} offset={`${s.t * 100}%`} stopColor={s.c} />
-            ))}
-          </linearGradient>
-        </defs>
-        <rect
-          x={10}
-          y={10}
-          width={300}
-          height={14}
-          fill={`url(#${id})`}
-          stroke="#e5e7eb"
-        />
-        <g fontSize={10} fill="#374151">
-          <text x={10} y={40}>
-            0%
-          </text>
-          <text x={150} y={40} textAnchor="middle">
-            50%
-          </text>
-          <text x={310} y={40} textAnchor="end">
-            100%
-          </text>
-        </g>
-      </svg>
-    </div>
-  );
-}
