@@ -14,3 +14,7 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Ignore Obsidian planning documents
+.obsidian
+*.canvas
