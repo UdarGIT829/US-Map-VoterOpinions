@@ -18,29 +18,10 @@ import useZoom from "./hooks/useZoom.js";
  *  - Styling uses Tailwind classes (available in this environment)
  */
 
-function useStateFipsFromFcc() {
-  const [map, setMap] = React.useState(null);
-  React.useEffect(() => {
-    let cancelled = false;
-    fetch("/fips.txt")
-      .then(r => r.text())
-      .then(txt => {
-        const out = {};
-        for (const raw of txt.split(/\r?\n/)) {
-          const line = raw.trim();
-          if (!line) continue;
-          const m = line.match(/^(\d{2})\s+(.+?)\s+([A-Z]{2})$/);
-          if (m) {
-            const [, ss, , abbr] = m;
-            out[abbr] = ss.padStart(2, "0");
-          }
-        }
-        if (!cancelled) setMap(out);
-      });
-    return () => { cancelled = true; };
-  }, []);
-  return map; // { CA: "06", ... } or null while loading
-}
+const DATA_API_BASE =
+  (import.meta && import.meta.env && import.meta.env.VITE_DATA_API_URL) ||
+  "http://127.0.0.1:12000";
+
 
 // Sample values (0..1) to demo coloring
 
@@ -54,28 +35,6 @@ const WIDTH = 980;
 const HEIGHT = 610;
 
 
-// Compute per-state values as the mean of its counties, plus optional jitter
-function computeStateValuesFromCounties(countyVals, jitter = 0.02) {
-  const sum = {};
-  const count = {};
-  for (const [fips5, v] of Object.entries(countyVals)) {
-    if (!fips5) continue;
-    const st = String(fips5).slice(0, 2);
-    sum[st] = (sum[st] || 0) + (typeof v === 'number' ? v : Number(v));
-    count[st] = (count[st] || 0) + 1;
-  }
-  const out = {};
-  for (const st of Object.keys(sum)) {
-    const mean = sum[st] / count[st];
-    const j = jitter ? (Math.random() * 2 - 1) * jitter : 0; // ±jitter
-    let val = mean + j;
-    if (val < 0) val = 0;
-    if (val > 1) val = 1;
-    out[st] = val;
-  }
-  return out;
-}
-
 export default function USMapMockup() {
   const svgRef = useRef(null);
   const gRef = useRef(null);
@@ -86,40 +45,157 @@ export default function USMapMockup() {
   const [selectedStateFips, setSelectedStateFips] = useState(null);
   const [hoverLabel, setHoverLabel] = useState(null);
 
+  // Store the full payloads for devtools inspection
+  const [statePayloads, setStatePayloads] = useState({});
+  const [countyPayloads, setCountyPayloads] = useState({});
+
+  // Very light heuristic so the map can still color something.
+  // Adjust this once you decide a specific metric from your API.
+  function deriveValueForChoropleth(payload) {
+    if (!payload) return null;
   
+    console.log(payload.political_party)
+    const p = payload.political_party || {};
+
+    const p_share = p.share || {};
+  
+    // 1) Prefer spec fields directly
+    if (typeof p_share.democratic === "number" && p_share.democratic >= 0 && p_share.democratic <= 1) {
+      console.log("HERE")
+      return p_share.democratic;
+    }
+  
+    // 2) Fallback: compute from alternative labels if both sides present
+    const dAlt = p.democrat ?? p.dem ?? p.D ?? p.blue;
+    const rAlt = p.rep_share ?? p.republican ?? p.rep ?? p.R ?? p.red;
+    if (typeof dAlt === "number" && typeof rAlt === "number" && dAlt + rAlt > 0) {
+      const share = dAlt / (dAlt + rAlt);
+      return Math.max(0, Math.min(1, share));
+    }
+  
+    // 3) Demographics fallback: pick a reasonable % if available
+    const demog = payload.demographics || {};
+    const candidates = [
+      demog.hispanic_pct,
+      demog.poverty_rate_pct,
+      demog.education?.bachelors_or_higher_pct,
+      demog.education?.hs_or_higher_pct,
+      demog.age?.under_18_pct,
+      demog.age?.["18_64_pct"],
+      demog.age?.["65_plus_pct"],
+    ];
+    for (const v of candidates) {
+      if (typeof v === "number" && v >= 0 && v <= 1) return v;
+    }
+  
+    // 4) Last resort
+    return 0.5;
+  }
+  
+
+
   // Load /public/fips.txt and populate county/state values
   useEffect(() => {
     let cancelled = false;
-    fetch("/fips.txt")
-      .then(r => {
-        if (!r.ok) throw new Error(`Failed to fetch /fips.txt: ${r.status}`);
-        return r.text();
-      })
-      .then(txt => {
-        if (cancelled) return;
-
-        // Keep only actual county/county-equivalent codes (exclude state headers XX000)
-        const countyCodes = [];
-        const lines = txt.split(/\r?\n/);
-        for (const line of lines) {
-          const m = line.match(/^\s*(\d{5})\b/);
-          if (!m) continue;
-          const code = m[1];
-          if (code.slice(2) === "000") continue; // skip state-level lines
-          countyCodes.push(code);
+  
+    async function loadAll() {
+      // 1) Parse FIPS file to get county 5-digit codes and state-level "SS000" codes
+      const txtResp = await fetch("/fips.txt");
+      if (!txtResp.ok) throw new Error(`Failed to fetch /fips.txt: ${txtResp.status}`);
+      const txt = await txtResp.text();
+  
+      const countyCodes = [];
+      const stateHeaderCodes = new Set(); // e.g., "06000" for CA
+      for (const raw of txt.split(/\r?\n/)) {
+        const m = raw.match(/^\s*(\d{5})\b/);
+        if (!m) continue;
+        const code5 = m[1];
+        if (code5.slice(2) === "000") {
+          stateHeaderCodes.add(code5);
+        } else {
+          countyCodes.push(code5);
         }
-
-        // Assign 0.65 to every county for now
-        const countyVals = Object.fromEntries(countyCodes.map(c => [c, 0.65]));
-        setCountyValues(countyVals);
-
-        // Derive state values = mean(counties) + tiny jitter
-        const stVals = computeStateValuesFromCounties(countyVals, 0.02);
-        setStateValues(stVals);
-      })
-      .catch(err => {
-        console.error(err);
+      }
+  
+      // 2) Ask your FastAPI for everything at once (both states & counties)
+      const requested_fips = [...stateHeaderCodes, ...countyCodes];
+  
+      const apiResp = await fetch(DATA_API_BASE+"/data/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          demographics: true,
+          political_party: true,
+          requested_fips,
+        }),
       });
+  
+      if (!apiResp.ok) {
+        throw new Error(`FastAPI /data/ failed: ${apiResp.status}`);
+      }
+  
+      const payload = await apiResp.json();
+      if (cancelled) return;
+  
+      const byFips = payload?.response_fips || {};
+  
+      // 3) Split into state vs county payloads and compute map values
+      const nextCountyPayloads = {};
+      const nextStatePayloads = {};
+      const nextCountyValues = {};
+      const nextStateValues = {};
+  
+      for (const [key, obj] of Object.entries(byFips)) {
+        // States may come back as "SS000" (5 chars) or "SS" (2 chars); handle both.
+        if (key.length === 5 && key.slice(2) === "000") {
+          const ss = key.slice(0, 2);
+          nextStatePayloads[ss] = obj;
+          nextStateValues[ss] = deriveValueForChoropleth(obj);
+        } else if (key.length === 2) {
+          nextStatePayloads[key] = obj;
+          nextStateValues[key] = deriveValueForChoropleth(obj);
+        } else if (key.length === 5) {
+          nextCountyPayloads[key] = obj;
+          nextCountyValues[key] = deriveValueForChoropleth(obj);
+        }
+      }
+  
+      // 4) For any state missing a direct state value, derive from its counties
+      const statesSeen = new Set(
+        [...Object.keys(nextStatePayloads), ...Object.keys(nextStateValues)]
+      );
+      // Build from counties by 2-digit prefix
+      const sum = {};
+      const count = {};
+      for (const [fips5, val] of Object.entries(nextCountyValues)) {
+        const ss = fips5.slice(0, 2);
+        sum[ss] = (sum[ss] || 0) + (typeof val === "number" ? val : 0);
+        count[ss] = (count[ss] || 0) + 1;
+      }
+      for (const ss of Object.keys(sum)) {
+        if (!statesSeen.has(ss) && count[ss] > 0) {
+          nextStateValues[ss] = sum[ss] / count[ss];
+        }
+      }
+  
+      // 5) Commit to state + expose for inspector
+      setCountyPayloads(nextCountyPayloads);
+      setStatePayloads(nextStatePayloads);
+      setCountyValues(nextCountyValues);
+      setStateValues(nextStateValues);
+  
+      if (typeof window !== "undefined") {
+        window.__FIPS_DATA__ = byFips;             // raw response keyed by requested id
+        window.__STATE_PAYLOADS__ = nextStatePayloads;   // keyed by "SS"
+        window.__COUNTY_PAYLOADS__ = nextCountyPayloads; // keyed by "SSCCC"
+        console.info("FIPS data loaded:", {
+          states: Object.keys(nextStatePayloads).length,
+          counties: Object.keys(nextCountyPayloads).length,
+        });
+      }
+    }
+  
+    loadAll().catch(err => console.error(err));
     return () => { cancelled = true; };
   }, []);
 
@@ -242,7 +318,7 @@ export default function USMapMockup() {
         .attr("stroke-width", 0.4)
         .on("mousemove", (event, d) => {
           const v = countyValues[d.id];
-          const name = `${d.properties.name} County`;
+          const name = d.properties.name;
           setHoverLabel(
             `${name} — ${v == null ? "(no value)" : (v * 100).toFixed(1) + "%"}`,
           );
